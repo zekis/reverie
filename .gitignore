@@ -1,0 +1,39 @@
+# User data — the brain's memory is not source
+memory/cold_store/*.npz
+memory/cold_store/*.meta
+memory/metrics/*.csv
+memory/snapshots/*
+!memory/snapshots/.gitkeep
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Venv
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+debug.log
