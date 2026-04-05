@@ -28,27 +28,19 @@ from config import (HIGH_SALIENCE_MARGIN, LOW_SALIENCE_MARGIN,
 EDGE_LR = 0.1
 
 
-def record_interaction(question: str, result: dict,
-                       loader, parser, embedder,
-                       expected: str | None = None):
-    """Route the query outcome to one of three learning paths."""
+def record_interaction_geometric(result: dict, loader):
+    """Type-agnostic interaction recording — implicit margin-based path.
+
+    Routes query outcome to reward / penalise / ignore based on the
+    result's margin and answer presence. No text, no parser, no embedder.
+    Works for any modality."""
     answer = result.get("answer")
     margin = result.get("margin", 0.0)
     reinforced = result.get("reinforced", 0)
     sources = result.get("sources", [])
 
-    # Path A: explicit ground truth overrides implicit signal.
-    if expected is not None:
-        if _matches(answer, expected, embedder):
-            _reward(loader, sources, reinforced)
-        else:
-            _penalise(loader, sources)
-            _store_correction(question, expected, loader, parser, embedder)
-        return
-
-    # Path B: implicit signal from margin alone.
     # Abstention → miss.
-    if not answer:
+    if answer is None:
         _penalise(loader, sources)
         return
 
@@ -62,6 +54,27 @@ def record_interaction(question: str, result: dict,
         return
 
     # Middle band → ambiguous, no update.
+
+
+def record_interaction(question: str, result: dict,
+                       loader, parser, embedder,
+                       expected: str | None = None):
+    """Text-specific interaction recording. Routes to one of three paths."""
+    answer = result.get("answer")
+    reinforced = result.get("reinforced", 0)
+    sources = result.get("sources", [])
+
+    # Path A: explicit ground truth overrides implicit signal.
+    if expected is not None:
+        if _matches(answer, expected, embedder):
+            _reward(loader, sources, reinforced)
+        else:
+            _penalise(loader, sources)
+            _store_correction(question, expected, loader, parser, embedder)
+        return
+
+    # Path B: implicit signal — delegate to geometric path.
+    record_interaction_geometric(result, loader)
 
 
 # ---- Paths ----

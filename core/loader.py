@@ -59,9 +59,10 @@ class ExpertLoader:
         expert.save_cold(os.path.join(COLD_STORE_DIR, lru))
         del self.warm[lru]
 
-    def store_fact(self, lemma: str, scene_data: dict):
+    def store_fact(self, lemma: str, scene_data: dict,
+                   apply_hebbian: bool = True):
         expert = self.get_or_create(lemma)
-        expert.store(scene_data)
+        expert.store(scene_data, apply_hebbian=apply_hebbian)
 
     def query_expert(self, lemma: str, query_vec: bytes,
                      gap_role: str, subject_vec: bytes) -> dict:

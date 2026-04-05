@@ -15,14 +15,13 @@ from config import (CYCLE_MS, MAX_CYCLES, CONFIDENCE_THRESHOLD,
                     REPLAY_BUFFER_SIZE, REPLAY_DECAY,
                     REPLAY_DROP_BELOW, REPLAY_EDGE_LR)
 from learning.feedback import Feedback
+from core.reconciler import reconcile as default_reconcile
 
 
 class Oscillator:
-    def __init__(self, loader, embedder, parser, reconciler_fn):
+    def __init__(self, loader, reconcile_fn=None):
         self.loader = loader
-        self.embedder = embedder
-        self.parser = parser
-        self.reconcile = reconciler_fn
+        self.reconcile = reconcile_fn or default_reconcile
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._query_lock = threading.Lock()
@@ -149,16 +148,20 @@ class Oscillator:
 
     # ---- Query mode ----
 
-    def query(self, question: str) -> dict:
-        """Run an oscillating query to completion. Blocks daydream."""
-        with self._query_lock:
-            return self._query_cycles(question)
+    def query(self, gap: dict, keys: list[str]) -> dict:
+        """Run an oscillating query to completion. Blocks daydream.
 
-    def _query_cycles(self, question: str) -> dict:
-        gap = self.parser.parse_gap(question, self.embedder)
-        keys = self.parser.extract_keys(question)
+        gap: {query_vec: np.ndarray, subject_vec: np.ndarray,
+              role: str, ...}  (any other fields ignored)
+        keys: list of expert lemmas to seed cycle 0
+        """
+        with self._query_lock:
+            return self._query_cycles(gap, keys)
+
+    def _query_cycles(self, gap: dict, keys: list[str]) -> dict:
         fb = Feedback(gap["query_vec"])
         best_answer, best_conf = None, 0.0
+        best_answer_vec: bytes | None = None
         best_sources: list[str] = []
         best_margin = 0.0
         best_reinforced = 0
@@ -189,18 +192,23 @@ class Oscillator:
                     if r.get("score", 0) < 0.3:
                         expert.activation *= 0.5
 
-            res = self.reconcile(responses, self.embedder, alphas,
+            res = self.reconcile(responses, alphas,
                                  query_vec=gap["query_vec"])
             answer = res.get("answer")
             margin = res.get("margin", 0.0)
             conf = res.get("confidence", 0.0)
             reinf = res.get("reinforced", 0)
 
-            if answer:
-                av = self.embedder.embed(answer)
-                fb.blend(av)
+            if answer is not None and res.get("answer_vec") is not None:
+                av = np.frombuffer(res["answer_vec"], dtype=np.float32)
+                # Only blend when dims align — cross-dim adapters
+                # (e.g. scene_vec=concat vs slot_vec=component) can't
+                # feed back into the same context.
+                if len(av) == len(fb.context):
+                    fb.blend(av)
             if conf > best_conf:
                 best_answer = answer
+                best_answer_vec = res.get("answer_vec")
                 best_conf = conf
                 best_sources = res.get("sources", [])
                 best_margin = margin
@@ -208,13 +216,15 @@ class Oscillator:
             # Exit conditions
             if margin > CONFIDENCE_THRESHOLD and reinf >= 2:
                 self.record_for_replay(best_sources)
-                return {"answer": best_answer, "confidence": best_conf,
+                return {"answer": best_answer, "answer_vec": best_answer_vec,
+                        "confidence": best_conf,
                         "cycles": cycle + 1, "margin": best_margin,
                         "sources": best_sources,
                         "reinforced": best_reinforced}
             if answer == prev_answer and answer and margin > CONFIDENCE_THRESHOLD * 0.5:
                 self.record_for_replay(best_sources)
-                return {"answer": best_answer, "confidence": best_conf,
+                return {"answer": best_answer, "answer_vec": best_answer_vec,
+                        "confidence": best_conf,
                         "cycles": cycle + 1, "margin": best_margin,
                         "sources": best_sources,
                         "reinforced": best_reinforced}
@@ -222,6 +232,7 @@ class Oscillator:
 
         if best_margin > CONFIDENCE_THRESHOLD and best_reinforced >= 2:
             self.record_for_replay(best_sources)
-        return {"answer": best_answer, "confidence": best_conf,
+        return {"answer": best_answer, "answer_vec": best_answer_vec,
+                "confidence": best_conf,
                 "cycles": MAX_CYCLES, "margin": best_margin,
                 "sources": best_sources, "reinforced": best_reinforced}

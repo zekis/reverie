@@ -65,12 +65,15 @@ class LightExpert:
         weights = np.array(self.scene_weights)[:, None]
         self.scene_matrix = mat_normed * weights
 
-    def store(self, scene_data: dict):
-        """Add scene, apply Hebbian decay to contradictions."""
+    def store(self, scene_data: dict, apply_hebbian: bool = True):
+        """Add scene. apply_hebbian=True (default) decays existing scenes
+        that contradict this one. Set False to accumulate raw experience
+        without selection pressure — used during motor babbling / any
+        exploration phase where outcomes haven't yet been defined."""
         self.scene_texts.append(scene_data["source_text"])
         self.scene_slots.append(scene_data["slots"])
         vec = np.frombuffer(scene_data["vec"], dtype=np.float32).copy()
-        if self.scene_vecs:
+        if self.scene_vecs and apply_hebbian:
             apply_decay(vec, self.scene_vecs, self.scene_weights)
         self.scene_vecs.append(vec)
         self.scene_weights.append(1.0)
@@ -101,28 +104,38 @@ class LightExpert:
         # (target-role slot matches) over weak fallbacks. A lower-scored
         # scene that has the slot the query asks for beats a higher-
         # scored scene that only has fallback slots.
-        answer = None
+        answer_text = None
+        answer_vec_bytes = None
         best_slots = self.scene_slots[sorted_idx[0]]
         K = min(5, len(sorted_idx))
         for j in range(K):
             idx = int(sorted_idx[j])
-            candidate = self._extract_gap(
+            slot = self._extract_gap(
                 self.scene_slots[idx], gap_role, subject_vec, strong_only=True)
-            if candidate is not None:
-                answer = candidate
+            if slot is not None:
+                answer_text = slot.get("text", "")
+                answer_vec_bytes = slot.get("vec")
                 best_slots = self.scene_slots[idx]
                 break
         # If no strong extraction found, fall back on the top scene's weak
-        if answer is None:
-            answer = self._extract_gap(best_slots, gap_role, subject_vec)
-        if answer is None and top_score > 0.7:
-            if sorted_idx[0] < len(self.scene_texts):
-                answer = self.scene_texts[sorted_idx[0]]
+        if answer_text is None:
+            slot = self._extract_gap(best_slots, gap_role, subject_vec)
+            if slot is not None:
+                answer_text = slot.get("text", "")
+                answer_vec_bytes = slot.get("vec")
+        if answer_text is None and top_score > 0.7:
+            top_idx = int(sorted_idx[0])
+            if top_idx < len(self.scene_texts):
+                answer_text = self.scene_texts[top_idx]
+                # Scene-level fallback: use the scene vector itself
+                answer_vec_bytes = self.scene_vecs[top_idx].astype(
+                    np.float32).tobytes()
 
         self.activation *= (1.0 - COOLING_RATE)
         latency = (time.perf_counter() - t0) * 1e6
         return {
-            "answer": answer,
+            "answer": answer_text,
+            "answer_vec": answer_vec_bytes,
             "score": float(top_score),
             "margin": float(margin),
             "lemma": self.lemma,
@@ -142,7 +155,10 @@ class LightExpert:
             "det": ["attr", "acomp", "dobj"],
             "pobj": ["prep_on", "prep_in", "prep_at", "prep_for", "prep_with"],
         }
-        targets = target_map.get(gap_role, ["attr", "dobj", "nsubj"])
+        # Text roles have a bespoke fallback chain. For custom / non-text
+        # roles (e.g. "action", "outcome") fall through to the literal
+        # role — the slot labelled with that role IS the target.
+        targets = target_map.get(gap_role, [gap_role])
         skip = {"ROOT"}
         if gap_role in ("attr", "acomp", "det"):
             skip.add("nsubj")
@@ -158,8 +174,16 @@ class LightExpert:
             if "vec" not in slot or subject_vec is None:
                 return False
             v = np.frombuffer(slot["vec"], dtype=np.float32)
-            n = np.linalg.norm(v) * np.linalg.norm(subject_vec) + 1e-8
-            return float(np.dot(v, subject_vec) / n) > 0.92
+            # Dim mismatch or zero norm → no echo check (disabled
+            # automatically for non-text adapters that don't use a
+            # subject vector).
+            if len(v) != len(subject_vec) or len(v) == 0:
+                return False
+            vn = np.linalg.norm(v)
+            svn = np.linalg.norm(subject_vec)
+            if vn < 1e-8 or svn < 1e-8:
+                return False
+            return float(np.dot(v, subject_vec) / (vn * svn)) > 0.92
 
         def is_wh_answer(slot):
             return slot.get("text", "").strip().lower() in _WH_ANSWER_BLOCK
@@ -177,7 +201,7 @@ class LightExpert:
                     continue
                 if echo(slot):
                     continue
-                return slot.get("text", "")
+                return slot
         if strong_only:
             return None  # caller wants target-match only
         # 2) Strict fallback — skip WH, skip echo, skip skip-roles
@@ -187,14 +211,14 @@ class LightExpert:
                 continue
             if echo(slot):
                 continue
-            return slot.get("text", "")
+            return slot
         # 3) Loose last-resort — drop echo and skip-roles. Only WH and
         # gap are excluded. A WH-only scene returns None; anything else
         # returns its first non-WH slot.
         for slot in slots:
             if slot.get("is_gap") or is_wh_answer(slot):
                 continue
-            return slot.get("text", "")
+            return slot
         return None
 
     # ---- Temporal state ----

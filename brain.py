@@ -6,28 +6,42 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from language.embedder import Embedder
-from language import parser
-from language.reconciler import reconcile
 from core.loader import ExpertLoader
 from core.registry import Registry
 from core.oscillator import Oscillator
-from learning.interaction import record_interaction
+from learning.interaction import (record_interaction,
+                                  record_interaction_geometric)
 
 
 class Brain:
-    def __init__(self, warm_cold: bool = True):
-        self.embedder = Embedder()
+    def __init__(self, warm_cold: bool = True, use_language: bool = True,
+                 run_oscillator: bool = True):
+        """A Brain is one modality's memory.
+
+        use_language=True wires in the MiniLM embedder + spaCy parser
+        so the text adapter (learn/query) works. Set False for pure
+        sensorimotor / non-language brains — only learn_scene and
+        query_scene are available in that mode, and the heavy language
+        deps are never imported.
+        """
+        self.use_language = use_language
+        if use_language:
+            from language.embedder import Embedder
+            from language import parser as _parser
+            self.embedder = Embedder()
+            self._parser = _parser
+        else:
+            self.embedder = None
+            self._parser = None
         self.loader = ExpertLoader()
         self.registry = Registry(self.loader)
-        self.oscillator = Oscillator(
-            self.loader, self.embedder, parser, reconcile
-        )
+        self.oscillator = Oscillator(self.loader)
         if warm_cold:
             n = self.loader.warm_all_cold()
             if n > 0:
                 print(f"[brain] pre-warmed {n} experts from cold storage")
-        self.oscillator.start()
+        if run_oscillator:
+            self.oscillator.start()
 
     def save(self) -> int:
         """Persist all warm experts to cold storage. Returns count."""
@@ -35,26 +49,49 @@ class Brain:
 
     # ---- Public API ----
 
-    def learn(self, text: str):
-        """Store a fact. Top 3 keys by specificity (fewest existing scenes)."""
-        scene = parser.parse_scene(text, self.embedder)
-        keys = scene["keys"]
+    # ---- Primitives: type-agnostic ----
+
+    def learn_scene(self, scene: dict, keys: list[str] | None = None,
+                    top_k: int = 3, apply_hebbian: bool = True) -> int:
+        """Store a pre-built scene. scene must contain {vec, slots, keys,
+        source_text}. Stores into top_k keys by specificity (fewest
+        existing scenes). Set top_k=None to use all keys. Set
+        apply_hebbian=False to accumulate experience without decay
+        (motor-babbling / exploration phase)."""
+        keys = keys if keys is not None else scene.get("keys", [])
         if not keys:
             return 0
-        # Specificity: keys whose experts have fewest scenes are most specific
         scored = []
         for k in keys:
             n = len(self.loader.warm[k].scene_vecs) if k in self.loader.warm else 0
             scored.append((k, n))
         scored.sort(key=lambda x: x[1])
-        stored = 0
-        for key, _ in scored[:3]:
-            self.loader.store_fact(key, scene)
-            stored += 1
-        return stored
+        if top_k is not None:
+            scored = scored[:top_k]
+        for key, _ in scored:
+            self.loader.store_fact(key, scene, apply_hebbian=apply_hebbian)
+        return len(scored)
+
+    def query_scene(self, gap: dict, keys: list[str]) -> dict:
+        """Run an oscillating query from a pre-built gap dict. Records
+        the interaction via the geometric (implicit) path."""
+        result = self.oscillator.query(gap, keys)
+        record_interaction_geometric(result, self.loader)
+        return result
+
+    # ---- Text adapter (requires use_language=True) ----
+
+    def learn(self, text: str):
+        """Store a fact. Top 3 keys by specificity (fewest existing scenes)."""
+        if not self.use_language:
+            raise RuntimeError("learn(text) requires use_language=True")
+        scene = self._parser.parse_scene(text, self.embedder)
+        return self.learn_scene(scene)
 
     def learn_bulk(self, texts: list[str]):
         """Bulk storage mode — no LRU eviction until done."""
+        if not self.use_language:
+            raise RuntimeError("learn_bulk(texts) requires use_language=True")
         self.loader.start_bulk()
         try:
             for t in texts:
@@ -63,12 +100,16 @@ class Brain:
             self.loader.end_bulk()
 
     def query(self, question: str, expected: str | None = None) -> dict:
-        """Run an oscillating query. If expected is provided, the
+        """Run an oscillating text query. If expected is provided, the
         interaction uses ground-truth salience; otherwise falls back
         to implicit margin-based signal."""
-        result = self.oscillator.query(question)
+        if not self.use_language:
+            raise RuntimeError("query(text) requires use_language=True")
+        gap = self._parser.parse_gap(question, self.embedder)
+        keys = self._parser.extract_keys(question)
+        result = self.oscillator.query(gap, keys)
         record_interaction(question, result, self.loader,
-                           parser, self.embedder, expected=expected)
+                           self._parser, self.embedder, expected=expected)
         return result
 
     # ---- Introspection ----
