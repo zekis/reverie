@@ -65,18 +65,20 @@ class LightExpert:
         weights = np.array(self.scene_weights)[:, None]
         self.scene_matrix = mat_normed * weights
 
-    def store(self, scene_data: dict, apply_hebbian: bool = True):
+    def store(self, scene_data: dict, apply_hebbian: bool = True,
+              initial_weight: float = 1.0):
         """Add scene. apply_hebbian=True (default) decays existing scenes
-        that contradict this one. Set False to accumulate raw experience
-        without selection pressure — used during motor babbling / any
-        exploration phase where outcomes haven't yet been defined."""
+        that contradict this one. initial_weight lets callers store new
+        scenes below baseline (<1.0) so they must EARN retrieval weight
+        via reinforcement — useful when mixing freshly-stored exploration
+        scenes with previously-reinforced long-term scenes."""
         self.scene_texts.append(scene_data["source_text"])
         self.scene_slots.append(scene_data["slots"])
         vec = np.frombuffer(scene_data["vec"], dtype=np.float32).copy()
         if self.scene_vecs and apply_hebbian:
             apply_decay(vec, self.scene_vecs, self.scene_weights)
         self.scene_vecs.append(vec)
-        self.scene_weights.append(1.0)
+        self.scene_weights.append(initial_weight)
         self._rebuild_matrix()
         for key in scene_data.get("keys", []):
             if key != self.lemma and key not in self.edge_weights:
