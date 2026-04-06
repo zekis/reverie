@@ -7,6 +7,14 @@ CONFIDENCE_THRESHOLD = 0.25
 QUERY_WEIGHT = 0.75
 ANSWER_WEIGHT = 0.25
 
+# Wave modulation — continuous sine modulation of expert contributions.
+# Replaces purely excitatory cycles with excitatory/inhibitory rhythm.
+# PHASE_INCREMENT is radians per query cycle. pi/2 = quarter-wave per
+# cycle, so 8 cycles sweep 2 full oscillations. Every expert peaks
+# twice and troughs twice across a full query.
+import math
+PHASE_INCREMENT = math.pi / 2
+
 # Experts
 MAX_WARM_EXPERTS = 500
 EMBEDDING_DIM = 384

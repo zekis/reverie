@@ -78,8 +78,8 @@ def main():
             scene = make_scene(s, a,
                                keys=["sm_experience", s_name],
                                label=f"{s_name}->{a_name}#{rep}")
-            n = brain.learn_scene(scene, top_k=None)
-            assert n == 2, f"expected 2 keys stored, got {n}"
+            handles = brain.learn_scene(scene, top_k=None)
+            assert len(handles) == 2, f"expected 2 keys stored, got {len(handles)}"
     print(f"  stats: {brain.stats()}")
 
     # Query each sensor and check the returned action vector is closest

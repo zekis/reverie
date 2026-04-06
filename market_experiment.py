@@ -50,6 +50,14 @@ HEBBIAN_MAX_W = 3.0
 HEBBIAN_MIN_W = 0.05
 REBUILD_EVERY = 500     # rebuild expert matrices every N training scenes
 
+# Prediction-error feedback: the 13th feature tracks rolling accuracy
+# of the brain's own predictions. High PE = brain is currently
+# unreliable on this regime. Feature lets retrieval condition on
+# "is this a state where I've been reliable lately?"
+USE_PE_FEATURE = True
+PE_WINDOW = 20          # rolling window for prediction-error accumulation
+PE_REGIME_THRESHOLD = 0.55  # > threshold => ctx_unreliable
+
 
 # ---- Binance data pull ----
 
@@ -207,7 +215,7 @@ def regime_keys(features):
     multiple voters at query time, which is what produces a meaningful
     margin across experts."""
     # Feature indices (from compute_features): 4=vol_ratio, 5=pos-0.5,
-    # 7=slope5*100, 8=slope20*100, 9=rsi-centred.
+    # 7=slope5*100, 8=slope20*100, 9=rsi-centred, 12=rolling_pe (if PE).
     keys = ["market"]
     keys.append("vol_high" if features[4] > 0.0 else "vol_low")
     if features[7] > 0.3:
@@ -223,6 +231,10 @@ def regime_keys(features):
     else:
         keys.append("macro_flat")
     keys.append("pos_high" if features[5] > 0.0 else "pos_low")
+    # Prediction-error regime partition
+    if USE_PE_FEATURE and len(features) > 12:
+        keys.append("ctx_unreliable" if features[12] > PE_REGIME_THRESHOLD
+                    else "ctx_reliable")
     return keys
 
 
@@ -250,9 +262,9 @@ def build_gap(features):
 
 def online_hebbian_update(brain, features, true_cls, keys):
     """For each relevant expert, find the current nearest-neighbour scene
-    by feature-cosine. If that neighbour's outcome slot matches the new
-    scene's true outcome, boost it; otherwise decay it. This compresses
-    the pool toward scenes whose local geometry is predictive."""
+    by feature-cosine. If that neighbour's outcome matches true_cls,
+    boost it; else decay it. Goes through brain.reinforce with
+    rebuild=False; caller is responsible for periodic brain.rebuild()."""
     feat = features.astype(np.float32)
     fn = feat / (np.linalg.norm(feat) + 1e-8)
     for key in keys:
@@ -261,7 +273,6 @@ def online_hebbian_update(brain, features, true_cls, keys):
         exp = brain.loader.warm[key]
         if exp.scene_matrix is None or len(exp.scene_vecs) == 0:
             continue
-        # Direct matrix-multiply — sidesteps oscillator/reconciler for speed
         scores = exp.scene_matrix @ fn
         top_idx = int(np.argmax(scores))
         slots = exp.scene_slots[top_idx]
@@ -273,14 +284,36 @@ def online_hebbian_update(brain, features, true_cls, keys):
         if len(ov) != N_CLASSES:
             continue
         pred_cls = int(np.argmax(ov))
-        if pred_cls == true_cls:
-            exp.scene_weights[top_idx] = min(
-                HEBBIAN_MAX_W,
-                exp.scene_weights[top_idx] * HEBBIAN_BOOST)
-        else:
-            exp.scene_weights[top_idx] = max(
-                HEBBIAN_MIN_W,
-                exp.scene_weights[top_idx] * HEBBIAN_DECAY)
+        mult = HEBBIAN_BOOST if pred_cls == true_cls else HEBBIAN_DECAY
+        brain.reinforce([(exp, top_idx)], mult,
+                        min_w=HEBBIAN_MIN_W, max_w=HEBBIAN_MAX_W,
+                        rebuild=False)
+
+
+def augment_features(base_features, rolling_pe):
+    """Append rolling_pe as the 13th feature (or not, if PE feature
+    disabled). This is the prediction-error feedback loop: the brain's
+    own past accuracy becomes an input to its future retrieval."""
+    if USE_PE_FEATURE:
+        return np.append(base_features, rolling_pe).astype(np.float32)
+    return base_features.astype(np.float32)
+
+
+def query_predict(brain, features, keys):
+    """Query brain, extract predicted class index (-1 if abstain)."""
+    gap = {
+        "query_vec": features.astype(np.float32),
+        "subject_vec": np.zeros(len(features), dtype=np.float32),
+        "role": "outcome",
+    }
+    result = brain.query_scene(gap, keys)
+    pred_cls = -1
+    av = result.get("answer_vec")
+    if av is not None:
+        vec = np.frombuffer(av, dtype=np.float32)
+        if len(vec) == N_CLASSES:
+            pred_cls = int(np.argmax(vec))
+    return pred_cls, float(result.get("margin", 0.0))
 
 
 # ---- Experiment ----
@@ -331,62 +364,88 @@ def main():
           f"(baseline hit rate: {majority_rate:.3f})")
     print(f"  train: {len(train_idx)}   test: {len(test_idx)}")
 
-    mode = "online Hebbian" if ONLINE_HEBBIAN else "raw"
-    print(f"\nBuilding brain + loading train scenes ({mode})...")
+    mode_bits = []
+    if ONLINE_HEBBIAN:
+        mode_bits.append("online Hebbian")
+    if USE_PE_FEATURE:
+        mode_bits.append("PE feedback")
+    mode = " + ".join(mode_bits) if mode_bits else "raw"
+    print(f"\nBuilding brain + training sequentially ({mode})...")
     brain = Brain(warm_cold=False, use_language=False, run_oscillator=False)
     t0 = time.time()
+
+    # Rolling prediction-error tracker. At each candle: query brain,
+    # compare to actual outcome, append 0/1 to recent_errors. The 13th
+    # feature is mean(recent_errors) — the brain's recent unreliability.
+    recent_errors: list = []
+
+    def current_pe():
+        if not recent_errors:
+            return 0.5  # neutral prior (mid of 0..1)
+        return sum(recent_errors) / len(recent_errors)
+
     for i, t in enumerate(train_idx):
-        if ONLINE_HEBBIAN:
-            keys = regime_keys(feats[t])
-            online_hebbian_update(brain, feats[t], int(outs[t]), keys)
-        scene = build_scene(feats[t], int(outs[t]), int(t))
+        feat_aug = augment_features(feats[t], current_pe())
+        keys = regime_keys(feat_aug)
+
+        # Query BEFORE storing so we can measure reliability
+        has_scenes = brain.stats()["total_scenes"] > 0
+        if has_scenes:
+            pred_cls, _ = query_predict(brain, feat_aug, keys)
+            if pred_cls >= 0:
+                err = 0 if pred_cls == int(outs[t]) else 1
+                recent_errors.append(err)
+                if len(recent_errors) > PE_WINDOW:
+                    recent_errors.pop(0)
+
+        if ONLINE_HEBBIAN and has_scenes:
+            online_hebbian_update(brain, feat_aug, int(outs[t]), keys)
+
+        scene = build_scene(feat_aug, int(outs[t]), int(t))
         brain.learn_scene(scene, top_k=None, apply_hebbian=False)
+
         if ONLINE_HEBBIAN and (i + 1) % REBUILD_EVERY == 0:
-            # Stale matrices use old weights; periodic rebuilds keep the
-            # online updates visible to subsequent neighbour lookups.
-            for exp in brain.loader.warm.values():
-                if exp.scene_vecs:
-                    exp._rebuild_matrix()
-    # Final rebuild (weight changes since last rebuild)
-    if ONLINE_HEBBIAN:
-        for exp in brain.loader.warm.values():
-            if exp.scene_vecs:
-                exp._rebuild_matrix()
+            brain.rebuild()
+
+    brain.rebuild()
     print(f"  stored {brain.stats()['total_scenes']} scenes "
           f"in {time.time()-t0:.1f}s")
+    print(f"  final rolling PE (train): {current_pe():.3f}  "
+          f"(window={len(recent_errors)})")
 
     if ONLINE_HEBBIAN:
-        # Summarise weight shaping per expert
         print("  weight shape per expert:")
         for lem, exp in sorted(brain.loader.warm.items(),
                                key=lambda kv: -len(kv[1].scene_vecs)):
             w = np.array(exp.scene_weights)
             n_b = int((w > 1.1).sum())
             n_d = int((w < 0.9).sum())
-            print(f"    {lem:12s} n={len(w):5d}  boosted={n_b:4d} "
+            print(f"    {lem:14s} n={len(w):5d}  boosted={n_b:4d} "
                   f"decayed={n_d:4d}  w: mean={w.mean():.2f} "
                   f"min={w.min():.2f} max={w.max():.2f}")
 
-    print("\nQuerying test set...")
-    records = []  # (true_cls, pred_cls, margin)
+    print("\nQuerying test set (continues rolling PE from train)...")
+    records = []  # (true_cls, pred_cls, margin, pe_at_query)
     t0 = time.time()
     for i, t in enumerate(test_idx):
         if i % 500 == 0 and i > 0:
             dt = time.time() - t0
             print(f"  {i}/{len(test_idx)}  ({i/dt:.0f} q/s)")
-        gap, keys = build_gap(feats[t])
-        result = brain.query_scene(gap, keys)
-        pred_cls = -1
-        av = result.get("answer_vec")
-        if av is not None:
-            vec = np.frombuffer(av, dtype=np.float32)
-            if len(vec) == N_CLASSES:
-                pred_cls = int(np.argmax(vec))
-        records.append((int(outs[t]), pred_cls, float(result.get("margin", 0.0))))
+        pe_here = current_pe()
+        feat_aug = augment_features(feats[t], pe_here)
+        keys = regime_keys(feat_aug)
+        pred_cls, margin = query_predict(brain, feat_aug, keys)
+        # Update rolling error from this test prediction too
+        if pred_cls >= 0:
+            err = 0 if pred_cls == int(outs[t]) else 1
+            recent_errors.append(err)
+            if len(recent_errors) > PE_WINDOW:
+                recent_errors.pop(0)
+        records.append((int(outs[t]), pred_cls, margin, pe_here))
     print(f"  done in {time.time()-t0:.1f}s")
 
     records = np.array(records, dtype=[("true", "i4"), ("pred", "i4"),
-                                        ("margin", "f4")])
+                                        ("margin", "f4"), ("pe", "f4")])
 
     print("\n--- Results ---")
     n = len(records)
@@ -409,11 +468,33 @@ def main():
         hr = float((records["true"][mask] == c).sum()) / mask.sum()
         print(f"    {DIRECTIONS[c]:5s}: n={int(mask.sum()):5d}  hit={hr:.3f}")
 
+    answered = records[records["pred"] >= 0]
+
+    # PE-regime-stratified hit rate — does the rolling prediction-error
+    # feature carry information? If high-PE predictions are notably
+    # worse than low-PE, the feedback signal is real.
+    if USE_PE_FEATURE:
+        print("\n  hit rate by PE regime (rolling prediction error):")
+        print(f"    {'regime':>16s}  {'n':>6s}  {'hit':>6s}  "
+              f"{'mean_pe':>8s}  {'lift':>7s}")
+        reliable_mask = (answered["pe"] <= PE_REGIME_THRESHOLD)
+        unreliable_mask = ~reliable_mask
+        for name, mask in (("reliable (pe low)", reliable_mask),
+                           ("unreliable (pe high)", unreliable_mask)):
+            k = int(mask.sum())
+            if k == 0:
+                print(f"    {name:>16s}  {k:>6d}")
+                continue
+            hit = float((answered["true"][mask] == answered["pred"][mask]).sum()) / k
+            mean_pe = float(answered["pe"][mask].mean())
+            lift = hit - (1.0 / N_CLASSES)
+            print(f"    {name:>16s}  {k:>6d}  {hit:.3f}  "
+                  f"{mean_pe:>8.3f}  {lift:+.3f}")
+
     # Margin-bucketed hit rate — THE core question
     print("\n  hit rate by margin bucket:")
     buckets = [(0.0, 0.05), (0.05, 0.10), (0.10, 0.15), (0.15, 0.20),
                (0.20, 0.30), (0.30, 0.50), (0.50, 1.01)]
-    answered = records[records["pred"] >= 0]
     print(f"    {'bucket':>15s}  {'n':>6s}  {'hit':>6s}  {'lift vs chance':>15s}")
     for lo, hi in buckets:
         mask = (answered["margin"] >= lo) & (answered["margin"] < hi)

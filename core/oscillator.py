@@ -3,19 +3,42 @@
 Two modes, one rhythm:
   Query:    keys → fire warm experts → reconcile → blend context → cycle
   Daydream: traverse warm edges → faintly activate → cool all → snapshot
+
+Expert contributions are modulated by a continuous sine wave. Each
+expert has a natural phase (derived from its lemma hash). At any point
+in the wave, some experts are near peak (fully contributing) and others
+near trough (mostly suppressed). This is lateral inhibition — it stops
+the loudest signal from dominating every cycle and gives quieter
+experts their turn to be heard.
 """
 
+import hashlib
+import math
 import threading
 import time
 import numpy as np
 
 from config import (CYCLE_MS, MAX_CYCLES, CONFIDENCE_THRESHOLD,
                     DAYDREAM_TRAVERSAL_STRENGTH, DAYDREAM_MIN_ACTIVATION,
-                    DAYDREAM_EDGE_FANOUT,
+                    DAYDREAM_EDGE_FANOUT, PHASE_INCREMENT,
                     REPLAY_BUFFER_SIZE, REPLAY_DECAY,
                     REPLAY_DROP_BELOW, REPLAY_EDGE_LR)
 from learning.feedback import Feedback
 from core.reconciler import reconcile as default_reconcile
+
+
+def _natural_phase(lemma: str) -> float:
+    """Deterministic phase offset for an expert, derived from its lemma.
+    Distributed across [0, 2π) so that at any wave position roughly
+    half the experts are above average and half below."""
+    h = int(hashlib.md5(lemma.encode()).hexdigest()[:8], 16)
+    return (h / 0xFFFFFFFF) * 2 * math.pi
+
+
+def _wave_weight(phase: float, lemma: str) -> float:
+    """Continuous wave modulation: returns 0..1. At the expert's natural
+    peak → 1.0, at its trough → 0.0, smoothly varying in between."""
+    return 0.5 + 0.5 * math.sin(phase + _natural_phase(lemma))
 
 
 class Oscillator:
@@ -26,6 +49,7 @@ class Oscillator:
         self._stop = threading.Event()
         self._query_lock = threading.Lock()
         self._cycle_count = 0
+        self._phase = 0.0  # continuous wave phase (radians)
         # Replay buffer: recent interactions (sources + residual strength)
         # that get replayed offline during quiet daydream ticks.
         self._replay_buffer: list[dict] = []
@@ -63,33 +87,30 @@ class Oscillator:
                 time.sleep(remaining)
 
     def _daydream_tick(self):
-        """Cool all, then traverse edges from survivors to re-warm neighbours.
-
-        Cooling first means weakly-connected nodes fall below threshold and
-        stop spreading. The self-sustaining wave settles on densely-connected
-        clusters — the brain's most deeply embedded concepts.
-        """
+        """Cool all, then traverse edges from survivors to re-warm
+        neighbours. Wave-modulated: each expert's spread strength is
+        scaled by its position on the continuous sine wave, creating
+        a rolling activation pattern instead of uniform spread."""
         warm = self.loader.warm
         if not warm:
             return
+        self._phase += PHASE_INCREMENT
         # 1. Cool everything
         for exp in warm.values():
             exp.cool()
         # 2. Find survivors — nodes warm enough to still spread activation
         survivors = [(lemma, exp) for lemma, exp in warm.items()
                      if exp.activation > DAYDREAM_MIN_ACTIVATION]
-        # 3. Traverse top edges from each survivor, re-fire neighbours
+        # 3. Traverse top edges from each survivor, wave-modulated
         for lemma, exp in survivors:
+            wave_w = _wave_weight(self._phase, lemma)
             edges = sorted(exp.edge_weights.items(),
                            key=lambda x: -x[1])[:DAYDREAM_EDGE_FANOUT]
             for neighbour_lemma, edge_w in edges:
                 strength = (exp.activation * edge_w
-                            * DAYDREAM_TRAVERSAL_STRENGTH)
+                            * DAYDREAM_TRAVERSAL_STRENGTH * wave_w)
                 if strength < 1e-4:
                     continue
-                # Don't warm cold experts from daydream alone — edges are
-                # ephemeral hints, not storage triggers. Only re-fire what's
-                # already warm.
                 neighbour = warm.get(neighbour_lemma)
                 if neighbour is not None:
                     neighbour.fire(strength)
@@ -166,8 +187,13 @@ class Oscillator:
         best_margin = 0.0
         best_reinforced = 0
         prev_answer = None
+        # Reset wave phase per query — each query sweeps the same arc,
+        # ensuring reproducible expert weighting across cycles.
+        query_phase = 0.0
 
         for cycle in range(MAX_CYCLES):
+            query_phase += PHASE_INCREMENT
+
             # Cycle 0: use extracted keys. Later: nearest-neighbour from context.
             if cycle == 0:
                 lemmas = keys
@@ -182,12 +208,20 @@ class Oscillator:
                 expert = self.loader.warm_expert(lem) or self.loader.get_or_create(lem)
                 if expert.scene_matrix is None:
                     continue
-                expert.fire(strength=0.3)
+                # Wave-modulated firing: expert contribution is scaled
+                # by its position on the continuous sine wave. Near peak
+                # → full contribution; near trough → mostly suppressed.
+                wave_w = _wave_weight(query_phase, lem)
+                expert.fire(strength=0.3 * wave_w)
                 r = expert.query(fb.context.tobytes(), gap["role"],
                                  gap["subject_vec"].tobytes())
-                if r.get("answer"):
+                if r.get("answer") is not None:
+                    # Modulate the raw similarity score by wave weight
+                    # so the reconciler naturally favours currently-
+                    # peaking experts over currently-suppressed ones.
+                    r["score"] *= wave_w
                     responses.append(r)
-                    alphas[lem] = expert.local_alpha
+                    alphas[lem] = expert.local_alpha * wave_w
                     # Inhibition: weak-scoring experts get dampened
                     if r.get("score", 0) < 0.3:
                         expert.activation *= 0.5

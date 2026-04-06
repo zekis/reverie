@@ -56,12 +56,19 @@ class World:
         return False
 
 
+MAX_FAILURES = 10  # saturation point for prediction_error sensor
+
+
 class Ant:
     def __init__(self, world):
         self.world = world
         self.pos = NEST
         self.heading = 0
         self.carrying = False
+        # Prediction-error state — tracks the ant's own proprioceptive
+        # expectation-vs-reality signal. Initially neutral (no prior action).
+        self.last_action_succeeded = 0.0
+        self.recent_failures = 0  # 0..MAX_FAILURES
 
     def front_cell(self):
         dx, dy = HEADINGS[self.heading]
@@ -90,36 +97,62 @@ class Ant:
             "heading_w": heading_vec[3],
             "nest_dx": float(nest_dx),
             "nest_dy": float(nest_dy),
+            # Prediction-error signals: the state-machine trigger.
+            # last_action_succeeded: did the action do its thing?
+            # prediction_error: running count of recent failures (stuck-ness).
+            "last_action_succeeded": self.last_action_succeeded,
+            "prediction_error": self.recent_failures / MAX_FAILURES,
         }
 
     def execute(self, action: str) -> dict:
-        """Runs one action, returns outcome dict."""
+        """Runs one action, returns outcome dict. Also updates the ant's
+        own prediction-error state: did the action produce its intended
+        effect, or was it blocked / no-op'd?"""
         outcome = {"food_collected": 0, "food_delivered": 0,
                    "hit_wall": 0, "noop": 0}
+        succeeded = False
         if action == "move_forward":
             ahead = self.front_cell()
             if self.world.is_wall(ahead):
                 outcome["hit_wall"] = 1
+                # Expected to move, hit a wall — prediction error.
             else:
                 self.pos = ahead
+                succeeded = True
         elif action == "turn_left":
             self.heading = (self.heading - 1) % 4
+            succeeded = True  # turns always change heading as intended
         elif action == "turn_right":
             self.heading = (self.heading + 1) % 4
+            succeeded = True
         elif action == "pick_up":
             ahead = self.front_cell()
             if not self.carrying and self.world.take_food(ahead):
                 self.carrying = True
                 outcome["food_collected"] = 1
+                succeeded = True
             else:
+                # Tried to pick up, nothing happened — prediction error.
+                # (Expected food, found none OR already carrying.)
                 outcome["noop"] = 1
         elif action == "drop":
             if self.carrying and self.pos == NEST:
                 self.carrying = False
                 self.world.food_delivered += 1
                 outcome["food_delivered"] = 1
+                succeeded = True
             else:
+                # Tried to drop, nothing happened — prediction error.
                 outcome["noop"] = 1
+
+        # Update prediction-error state. recent_failures saturates at
+        # MAX_FAILURES; one success decays it by 1. This gives the brain
+        # a continuous "stuck-ness" signal to key state transitions on.
+        self.last_action_succeeded = 1.0 if succeeded else 0.0
+        if succeeded:
+            self.recent_failures = max(0, self.recent_failures - 1)
+        else:
+            self.recent_failures = min(MAX_FAILURES, self.recent_failures + 1)
         return outcome
 
 
@@ -130,7 +163,9 @@ def encode_sensor(s):
                      s["wall_ahead"],
                      s["heading_n"], s["heading_e"],
                      s["heading_s"], s["heading_w"],
-                     s["nest_dx"], s["nest_dy"]], dtype=np.float32)
+                     s["nest_dx"], s["nest_dy"],
+                     s["last_action_succeeded"],
+                     s["prediction_error"]], dtype=np.float32)
 
 
 def encode_action(action):
@@ -157,6 +192,14 @@ def context_keys(sensors):
         keys.append("ctx_wall_ahead")
     if sensors["at_nest"]:
         keys.append("ctx_at_nest")
+    # Prediction-error partition: separates flowing/directed states
+    # (low error, things are working) from stuck/searching states
+    # (high error, need a new strategy). Keeps COLLECT/RETURN scenes
+    # from conflicting with SEARCH scenes in retrieval.
+    if sensors["prediction_error"] > 0.3:
+        keys.append("ctx_stuck")
+    else:
+        keys.append("ctx_flowing")
     return keys
 
 

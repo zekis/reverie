@@ -20,9 +20,20 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from brain import Brain
-from ant_sim import (World, Ant, ACTIONS, encode_sensor, encode_action,
+from ant_sim import (World, Ant, ACTIONS, NEST, encode_sensor, encode_action,
                      encode_outcome, context_keys, build_scene,
                      apply_reward_weights)
+
+
+def dist_to_nest(pos):
+    return abs(pos[0] - NEST[0]) + abs(pos[1] - NEST[1])
+
+
+def dist_to_nearest_food(pos, world):
+    active = [p for p, n in world.food.items() if n > 0]
+    if not active:
+        return 999
+    return min(abs(pos[0] - p[0]) + abs(pos[1] - p[1]) for p in active)
 
 
 # ---- Hyperparameters ----
@@ -87,68 +98,95 @@ def run_lifetime(brain, rng, epsilon):
     ant = Ant(world)
     stats = {"food_collected": 0, "food_delivered": 0, "hit_wall": 0,
              "positions": set()}
-    # Snapshot per-expert scene counts so we can decay only NEWLY-stored
-    # scenes at end of lifetime (not scenes carried over from prior gens).
-    start_counts = {id(exp): len(exp.scene_vecs)
-                    for exp in brain.loader.warm.values()}
-    # Eligibility trace: (expert, scene_idx, step) for recent stores
+    # Session snapshot — session_end decays scenes stored since now
+    # that weren't reinforced.
+    snapshot = brain.session_begin()
+    # Eligibility trace with per-step progressiveness metadata:
+    # (expert, scene_idx, step, action, progressive) per trace entry.
     trace: list[tuple] = []
-    # Reinforcement set: (id(expert), idx) pairs touched by any trace boost
-    reinforced: set = set()
+    # Reinforced handles: (expert, idx) pairs touched by any trace boost
+    reinforced_handles: set = set()
 
-    def apply_trace_boost(multiplier):
-        for exp, idx, _ in trace:
-            reinforced.add((id(exp), idx))
-            exp.scene_weights[idx] = float(np.clip(
-                exp.scene_weights[idx] * multiplier, 0.1, 2.5))
+    def apply_trace_boost(multiplier, turn_lookahead: int = 3):
+        """Causal boost: only reinforce progressive actions, plus turns
+        that preceded a progressive move within turn_lookahead steps."""
+        if not trace:
+            return
+        progressive_idx = set()
+        for i, entry in enumerate(trace):
+            if entry[4]:  # progressive flag
+                progressive_idx.add(i)
+        # Attribute turns to following progressive moves (causal link)
+        for i, entry in enumerate(trace):
+            if entry[3] in ("turn_left", "turn_right"):
+                for j in range(i + 1, min(i + 1 + turn_lookahead, len(trace))):
+                    if j in progressive_idx:
+                        progressive_idx.add(i)
+                        break
+        handles = [(trace[i][0], trace[i][1]) for i in progressive_idx]
+        brain.reinforce(handles, multiplier)
+        for h in handles:
+            reinforced_handles.add(h)
+
+    def apply_step_decay(multiplier):
+        """Narrow decay: only the current step's scenes. Wall hits are a
+        point-event, not a trajectory failure — decay one step."""
+        if not trace:
+            return
+        last_step = trace[-1][2]
+        handles = [(exp, idx) for exp, idx, step, _, _ in trace
+                   if step == last_step]
+        brain.reinforce(handles, multiplier)
 
     for step in range(LIFETIME_STEPS):
         sensors = ant.sense()
         action = choose_action(brain, sensors, rng, epsilon)
+        # Snapshot pre-action state for progressiveness classification
+        prev_dist_nest = dist_to_nest(ant.pos)
+        prev_dist_food = dist_to_nearest_food(ant.pos, world)
+        was_carrying = ant.carrying
         outcome = ant.execute(action)
-        scene = build_scene(sensors, action, outcome, step)
+        # Classify: did this action make task-relevant progress?
+        progressive = False
+        if outcome["food_collected"] or outcome["food_delivered"]:
+            progressive = True
+        elif action == "move_forward":
+            new_dist_nest = dist_to_nest(ant.pos)
+            new_dist_food = dist_to_nearest_food(ant.pos, world)
+            if was_carrying and new_dist_nest < prev_dist_nest:
+                progressive = True
+            elif not was_carrying and new_dist_food < prev_dist_food:
+                progressive = True
 
-        # Store under each context key directly, tracking the insertion
-        # index so the trace can reach back and reweight later. Initial
-        # weight 0.5 ensures new exploration scenes don't dominate
-        # retrieval until trace-reinforced — long-term reinforced scenes
-        # from prior generations remain at their earned weights.
-        for key in scene["keys"]:
-            exp = brain.loader.get_or_create(key)
-            exp.store(scene, apply_hebbian=False, initial_weight=0.5)
-            trace.append((exp, len(exp.scene_vecs) - 1, step))
+        scene = build_scene(sensors, action, outcome, step)
+        # Store under each context key. Initial weight 0.5: new scenes
+        # must earn retrieval dominance via reinforcement.
+        handles = brain.learn_scene(scene, top_k=None, apply_hebbian=False,
+                                    initial_weight=0.5)
+        for exp, idx in handles:
+            trace.append((exp, idx, step, action, progressive))
 
         # Trim trace to last TRACE_LEN steps
         while trace and step - trace[0][2] > TRACE_LEN:
             trace.pop(0)
 
-        # Reward dispatch
+        # Reward dispatch — causal
         if outcome["food_delivered"]:
             apply_trace_boost(DELIVER_BOOST)
         elif outcome["food_collected"]:
             apply_trace_boost(COLLECT_BOOST)
         elif outcome["hit_wall"]:
-            apply_trace_boost(WALL_DECAY)
+            apply_step_decay(WALL_DECAY)
 
         stats["food_collected"] += outcome["food_collected"]
         stats["food_delivered"] += outcome["food_delivered"]
         stats["hit_wall"] += outcome["hit_wall"]
         stats["positions"].add(ant.pos)
 
-    # Post-lifetime consolidation: new scenes that were never boosted by
-    # any trace decay. This compresses the pool toward reinforced
-    # experience — biological sleep consolidation applied to episodic
-    # memory. Old scenes inherited from prior generations aren't touched.
-    for exp in brain.loader.warm.values():
-        start = start_counts.get(id(exp), 0)
-        for i in range(start, len(exp.scene_weights)):
-            if (id(exp), i) not in reinforced:
-                exp.scene_weights[i] = max(
-                    0.1, exp.scene_weights[i] * BASELINE_DECAY)
-    # Single matrix rebuild per expert after all weight changes
-    for exp in brain.loader.warm.values():
-        if exp.scene_vecs:
-            exp._rebuild_matrix()
+    # Post-lifetime consolidation via brain API: scenes stored since
+    # snapshot that weren't reinforced get decayed.
+    brain.session_end(snapshot, list(reinforced_handles),
+                      decay=BASELINE_DECAY)
     stats["positions"] = len(stats["positions"])
     return stats
 
